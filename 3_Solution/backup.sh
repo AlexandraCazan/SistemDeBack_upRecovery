@@ -22,12 +22,6 @@ function encrypt_archive
 }
 
 
-SOURCE_DIRS=""
-BACKUP_DIR=""
-PREV_BACKUP=""
-ENCRYPT=""
-PASSWORD=""
-
 if [[ "$1" == "-c" || "$1" == "--config" ]]; then
     shift
     if [[ $# -eq 0 ]]; then
@@ -41,6 +35,10 @@ if [[ "$1" == "-c" || "$1" == "--config" ]]; then
         shift
     else
         # Nu e fișier, deci tratăm tot ce urmează ca directoare
+        BACKUP_DIR="$HOME/test_backups"
+	PREV_BACKUP="$HOME/test_backups/backup_20250711_120605.tar"
+	ENCRYPT="yes"
+	PASSWORD="alle2133"
         while [[ $# -gt 0 ]]; do
             if [[ -d "$1" ]]; then
                 SOURCE_DIRS="$SOURCE_DIRS $1"
@@ -94,13 +92,14 @@ do
 		fi
 		hash=$(get_hash "$file")
 		meta=$(get_metadata "$file")
-		echo "$file|$hash|$meta" >> "$META_NEW"
-		
-		old="${old_data["$file"]}"
-		if [[ "$old" != "$hash|$meta" ]]
-		then
-			FILES+=("$file")
+		rel_path=$(realpath --relative-to=/ "$file")
+		echo "$rel_path|$hash|$meta" >> "$META_NEW"
+		old="${old_data["$rel_path"]}"
+
+		if [[ "$old" != "$hash|$meta" ]]; then
+ 			FILES+=("/$rel_path")
 		fi
+
 	
 	done < <(find "$dir" -type f 2>/dev/null)
 done
