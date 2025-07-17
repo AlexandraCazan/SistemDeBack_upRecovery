@@ -16,24 +16,121 @@ function get_hash {
 function get_metadata {
     local file="$1"
     local acl_hash=$(getfacl --absolute-names --omit-header "$file" 2>/dev/null | sha256sum | cut -d ' ' -f1)
-    echo "$(stat --format "%U|%G|%a|%Y" "$file")|$acl_hash"
+    echo "$(stat --format "%U|%G|%a|%Y|%X" "$file")|$acl_hash"
 }
 
 function encrypt_archive {
     local input_file="$1"
     local password="$2"
     openssl enc -aes-256-cbc -salt -in "$input_file" -out "$input_file.enc" -pass pass:"$password"
-    rm "$input_file"
-    mv "$input_file.enc" "$input_file"
+    rm "$input_file" #sterge fisierul necriptat
+    mv "$input_file.enc" "$input_file" #inlocuieste fisierul original cu cel criptat :)
 }
 
 function escape_path {
     basename "$1" | sed 's|/|_|g'
 }
 
+function merge_metadata {
+    local dir="$1"
+    local tmp_metadata="$2"
+    local escaped=$(escape_path "$dir")
+    local meta_file="$BACKUP_DIR/metadata_${escaped}.db" #numele fisierului cu metadate pe baza directorului
+    
+    local merged_file=$(mktemp)
+    #fisier temporar pentru metadatele combinate
+    
+    if [[ -f "$meta_file" ]]
+    then
+        declare -A new_data=()
+        while IFS='|' read -r path hash meta
+        do
+            new_data["$path"]="$hash|$meta"
+        done < "$tmp_metadata"
+        
+        declare -A processed_files=()
+        
+        while IFS='|' read -r path hash meta
+        do
+            if [[ -f "/$path" ]]
+            then
+                if [[ -n "${new_data["$path"]}" ]]
+                then
+                    echo "$path|${new_data["$path"]}" >> "$merged_file"
+		    processed_files["$path"]="1"
+		    #scrie in fisierul de metadate combinate varianta noua
+                else
+                    echo "$path|$hash|$meta" >> "$merged_file"
+                    processed_files["$path"]="1"
+                    #daca fisierul nu este modificat, pastreaza vechile metadate
+                fi
+            fi
+        done < "$meta_file"
+        
+        #adauga fisierele noi care nu existau in metadatele vechi
+        for path in "${!new_data[@]}"
+        do
+            echo "$path|${new_data["$path"]}" >> "$merged_file"
+        done
+    else
+    	#daca nu exista metadate vechi, foloseste direct cele noi
+        cp "$tmp_metadata" "$merged_file"
+    fi
+    
+    sort "$merged_file" > "$meta_file"
+    rm "$merged_file"
+}
+
+function get_changed_files {
+    local dir="$1"
+    local escaped=$(escape_path "$dir")
+    local meta_file="$BACKUP_DIR/metadata_${escaped}.db"
+    local tmp_metadata="$TMP_DIR/metadata_${escaped}.db"
+    
+    declare -A old_data=()
+    local changed_files=()
+    
+    #incarca metadatele vechi daca exista
+    if [[ -f "$meta_file" ]]
+    then
+        while IFS='|' read -r path hash meta
+        do
+            old_data["$path"]="$hash|$meta"
+        done < "$meta_file"
+    fi
+    
+    > "$tmp_metadata" 
+    
+    while read -r file
+    do
+        if [[ ! -f "$file" ]]
+        then
+            continue
+        fi
+        
+        local hash=$(get_hash "$file")
+        local meta=$(get_metadata "$file")
+        local rel_path=$(realpath --relative-to=/ "$file")
+        
+        echo "$rel_path|$hash|$meta" >> "$tmp_metadata" #scrie in metadatele temporare
+        
+        local old="${old_data["$rel_path"]}"
+        if [[ "$old" != "$hash|$meta" ]] #verifica daca fisierul s-a modificat
+        then
+            changed_files+=("/$rel_path")
+        fi
+    done < <(find "$dir" -type f 2>/dev/null)
+    
+    echo "${#changed_files[@]}"
+    
+    > "$TMP_DIR/changed_files_${escaped}.tmp"  # Golește fișierul
+    for file in "${changed_files[@]}"
+    do
+    	echo "$file" >> "$TMP_DIR/changed_files_${escaped}.tmp"
+    done #salveaza intr-un fisier temporar toate fisierele care au fost modificate
+}
 
 MODE="$1"
-
 
 if [[ "$MODE" == "-r" ]]
 then
@@ -65,7 +162,7 @@ then
     do
         echo "$((i+1))) ${backup_files[$i]}"
     done
-
+    
     read -rp "Alege numarul fisierului de restaurat: " selection
 
     if ! echo "$selection" | egrep -q '^[0-9]+$' || (( selection < 1 || selection > ${#backup_files[@]} ))
@@ -116,7 +213,7 @@ then
             base="${filename%.*}"
             ext="${filename##*.}"
 
-            
+	    #daca are sufixul restore, il pastreaza
             if [[ "$base" == *"_restore" ]]
             then
                 restore_name="${filename}"
@@ -152,16 +249,13 @@ fi
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 
-if [[ "$MODE" == "-a" ]]
-then
+if [[ "$MODE" == "-a" ]]; then
     echo " "
     echo "				MOD AUTOMAT"
     echo " "
     SOURCE_DIRS="$DEFAULT_SOURCE_DIRS"
     BACKUP_DIR="$DEFAULT_BACKUP_DIR"
-
-elif [[ "$MODE" == "-i" ]]
-then
+elif [[ "$MODE" == "-i" ]]; then
     echo " "
     echo "				MOD INTERACTIV"
     echo " "
@@ -188,61 +282,57 @@ then
 fi
 
 ARCHIVE_PATH="$BACKUP_DIR/$ARCHIVE_NAME"
-
 mkdir -p "$BACKUP_DIR"
 TMP_DIR=$(mktemp -d)
-FILES=()
+
+ALL_CHANGED_FILES=()
+total_changes=0
 
 for dir in $SOURCE_DIRS
 do
     escaped=$(escape_path "$dir")
-    META_PREV="$BACKUP_DIR/metadata_${escaped}.db"
-    META_NEW="$TMP_DIR/metadata_${escaped}.db"
-    declare -A old_data=()
-
+    meta_file="$BACKUP_DIR/metadata_${escaped}.db"
+    
     echo "Analizez directorul: $dir"
-    echo " "
-
-    if [[ -f "$META_PREV" ]]
+    
+    if [[ -f "$meta_file" ]]
     then
         echo "> Metadate gasite -> Se va face backup incremental pentru $dir"
-        while IFS='|' read -r path hash meta
-        do
-            old_data["$path"]="$hash|$meta"
-        done < "$META_PREV"
     else
-        echo "Backup complet pentru $dir (fără metadate anterioare)"
+        echo "> Backup complet pentru $dir (fără metadate anterioare)"
     fi
-
-    while read -r file
-    do
-        if [[ ! -f "$file" ]]
-        then
-            continue
-        fi
-        hash=$(get_hash "$file")
-        meta=$(get_metadata "$file")
-        rel_path=$(realpath --relative-to=/ "$file")
-        echo "$rel_path|$hash|$meta" >> "$META_NEW"
-
-        old="${old_data["$rel_path"]}"
-        if [[ "$old" != "$hash|$meta" ]]
-        then
-            FILES+=("/$rel_path")
-        fi
-    done < <(find "$dir" -type f 2>/dev/null)
-
-    cp "$META_NEW" "$BACKUP_DIR/metadata_${escaped}.db"
+    
+    changes=$(get_changed_files "$dir")
+    total_changes=$((total_changes + changes))
+    
+    if [[ $changes -gt 0 ]]
+    then
+        echo "> Detectate $changes modificari in $dir"
+        while read -r file
+        do
+            if [[ -n "$file" ]]
+            then
+                ALL_CHANGED_FILES+=("$file")
+            fi
+        done < "$TMP_DIR/changed_files_${escaped}.tmp"
+    else
+        echo "> Nicio modificare detectata in $dir"
+    fi
+    
+    merge_metadata "$dir" "$TMP_DIR/metadata_${escaped}.db"
+    echo " "
 done
 
-if [[ ${#FILES[@]} -eq 0 ]]
-then
-    echo "Nicio modificare detectata. Nu s-a creat un nou backup."
-    rm -rf "$TMP_DIR" "$TMP_EXTRACT_DIR" 2>/dev/null
+if [[ $total_changes -eq 0 ]]; then
+    echo "Nicio modificare detectata in niciun director. Nu s-a creat un nou backup."
+    rm -rf "$TMP_DIR"
     exit 0
-else
-    tar -cf "$ARCHIVE_PATH" "${FILES[@]}"
 fi
+
+echo "Total modificari detectate: $total_changes fisiere"
+echo "Creare backup incremental..."
+
+tar -cf "$ARCHIVE_PATH" "${ALL_CHANGED_FILES[@]}"
 
 if [[ "$ENCRYPT" == "yes" && -n "$PASSWORD" ]]
 then
@@ -252,6 +342,6 @@ fi
 
 sed -i "s|^PREV_BACKUP=.*|PREV_BACKUP=\"$ARCHIVE_PATH\"|" "$CONFIG_FILE"
 
-echo "Backup final salvat în: $ARCHIVE_PATH"
+echo "Backup incremental salvat în: $ARCHIVE_PATH"
+echo "Continut: $total_changes fisiere modificate din directoarele: $SOURCE_DIRS"
 rm -rf "$TMP_DIR"
-
